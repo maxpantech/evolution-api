@@ -1927,20 +1927,145 @@ export class BaileysStartupService extends ChannelStartupService {
             if (events.call) {
               const call = events.call[0];
 
+              // Salvar LID original para garantir que nunca será null
+              const originalFrom = call.from;
+              const originalChatId = call.chatId;
+              const isLid = call.from?.endsWith('@lid');
+
+              // Variáveis para armazenar dados resolvidos
+              let resolvedRemoteJid = call.from;
+              let resolvedRemoteJidAlt: string | undefined;
+              let pushName: string | undefined;
+              let addressingMode: string = 'pn';
+
+              // Converter LID para número de telefone ANTES de qualquer operação
+              if (isLid) {
+                addressingMode = 'lid';
+                resolvedRemoteJidAlt = originalFrom;
+
+                try {
+                  // Primeira tentativa: usar o mapeamento do Baileys
+                  const phoneNumber = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+                  this.logger.debug(`[CALL] getPNForLID result for ${call.from}: ${phoneNumber}`);
+
+                  if (phoneNumber) {
+                    resolvedRemoteJid = phoneNumber;
+                    call.from = phoneNumber;
+                    call.chatId = phoneNumber;
+                  } else {
+                    // Segunda tentativa: buscar no cache isOnWhatsapp pelo jidOptions que contém o LID
+                    const cachedNumbers = await getOnWhatsappCache([call.from]);
+                    this.logger.debug(`[CALL] Cache result for ${call.from}: ${JSON.stringify(cachedNumbers)}`);
+
+                    if (cachedNumbers.length > 0 && cachedNumbers[0].jidOptions) {
+                      const whatsappJid = cachedNumbers[0].jidOptions.find((jid) => jid.endsWith('@s.whatsapp.net'));
+                      if (whatsappJid) {
+                        resolvedRemoteJid = whatsappJid;
+                        call.from = whatsappJid;
+                        call.chatId = whatsappJid;
+                      }
+                    } else {
+                      // Terceira tentativa: buscar diretamente no banco IsOnWhatsapp pelo LID no jidOptions
+                      const isOnWhatsappRecord = await this.prismaRepository.isOnWhatsapp.findFirst({
+                        where: {
+                          jidOptions: { contains: call.from },
+                        },
+                      });
+                      this.logger.debug(`[CALL] Direct DB result for ${call.from}: ${JSON.stringify(isOnWhatsappRecord)}`);
+
+                      if (isOnWhatsappRecord?.jidOptions) {
+                        const jidOptions = isOnWhatsappRecord.jidOptions.split(',');
+                        const whatsappJid = jidOptions.find((jid) => jid.endsWith('@s.whatsapp.net'));
+                        if (whatsappJid) {
+                          resolvedRemoteJid = whatsappJid;
+                          call.from = whatsappJid;
+                          call.chatId = whatsappJid;
+                        } else {
+                          // Se não encontrou @s.whatsapp.net, usar o remoteJid do registro
+                          resolvedRemoteJid = isOnWhatsappRecord.remoteJid;
+                          call.from = isOnWhatsappRecord.remoteJid;
+                          call.chatId = isOnWhatsappRecord.remoteJid;
+                        }
+                      }
+                    }
+                  }
+                } catch (error) {
+                  this.logger.warn(`[CALL] Failed to convert LID to phone number: ${error?.message}`);
+                }
+
+                // Garantir que nunca seja null
+                if (!call.from) {
+                  call.from = originalFrom;
+                  resolvedRemoteJid = originalFrom;
+                }
+                if (!call.chatId) {
+                  call.chatId = originalChatId;
+                }
+              }
+
+              // Buscar pushName do contato no banco de dados
+              try {
+                const contact = await this.prismaRepository.contact.findFirst({
+                  where: {
+                    instanceId: this.instanceId,
+                    OR: [{ remoteJid: resolvedRemoteJid }, { remoteJid: originalFrom }],
+                  },
+                });
+                if (contact?.pushName) {
+                  pushName = contact.pushName;
+                }
+              } catch (error) {
+                this.logger.debug(`[CALL] Failed to get pushName: ${error?.message}`);
+              }
+
               if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
+                this.client.rejectCall(call.id, originalFrom);
               }
 
               if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
-                }
                 const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
-
                 this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+
+                // Capturar o número real da mensagem enviada (Baileys resolve o LID internamente)
+                if (msg?.key?.remoteJid && msg.key.remoteJid.endsWith('@s.whatsapp.net')) {
+                  resolvedRemoteJid = msg.key.remoteJid;
+                  call.from = msg.key.remoteJid;
+                  call.chatId = msg.key.remoteJid;
+                  this.logger.debug(`[CALL] Got phone number from sent message: ${msg.key.remoteJid}`);
+
+                  // Salvar no cache para futuras chamadas
+                  await saveOnWhatsappCache([
+                    {
+                      remoteJid: msg.key.remoteJid,
+                      remoteJidAlt: originalFrom,
+                      lid: 'lid',
+                    },
+                  ]);
+                }
               }
 
-              this.sendDataWebhook(Events.CALL, call);
+              // Determinar se é o evento final da chamada
+              const finalStatuses = ['timeout', 'reject', 'accept', 'terminate'];
+              const isFinalEvent = finalStatuses.includes(call.status);
+
+              // Enviar webhook com dados no formato similar ao messages.upsert
+              const callData = {
+                ...call,
+                // Key no formato similar ao messages.upsert
+                key: {
+                  remoteJid: resolvedRemoteJid,
+                  remoteJidAlt: resolvedRemoteJidAlt,
+                  fromMe: false,
+                  id: call.id,
+                  participant: '',
+                  addressingMode,
+                },
+                pushName,
+                // Indicar se é o evento final da chamada
+                isFinalEvent,
+              };
+
+              this.sendDataWebhook(Events.CALL, callData);
             }
 
             if (events['connection.update']) {
