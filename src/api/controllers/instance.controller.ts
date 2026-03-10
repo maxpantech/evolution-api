@@ -457,7 +457,39 @@ export class InstanceController {
     }
   }
 
-  public async deleteInstance({ instanceName }: InstanceDto) {
+  public async deleteInstance({ instanceName, force }: InstanceDto) {
+    const isForce = force === true || force === 'true';
+
+    if (isForce) {
+      this.logger.error(`FORCE DELETE instance "${instanceName}"`);
+
+      try {
+        await this.waMonitor.waInstances[instanceName]?.logoutInstance();
+      } catch (error) {
+        this.logger.error(error);
+      }
+
+      try {
+        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+          this.waMonitor.waInstances[instanceName]?.clearCacheChatwoot();
+        }
+      } catch (error) {
+        this.logger.error(error);
+      }
+
+      try {
+        this.waMonitor.waInstances[instanceName]?.sendDataWebhook(Events.INSTANCE_DELETE, {
+          instanceName,
+          instanceId: this.waMonitor.waInstances[instanceName]?.instanceId,
+        });
+      } catch (error) {
+        this.logger.error(error);
+      }
+
+      await this.waMonitor.forceDeleteInstance(instanceName);
+      return { status: 'SUCCESS', error: false, response: { message: 'Instance force deleted' } };
+    }
+
     const { instance } = await this.connectionState({ instanceName });
     try {
       const waInstances = this.waMonitor.waInstances[instanceName];
