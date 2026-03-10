@@ -270,6 +270,47 @@ export class WAMonitoringService {
     }
   }
 
+  public async forceDeleteInstance(instanceName: string) {
+    try {
+      await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
+    } catch (error) {
+      this.logger.error(error);
+    }
+
+    this.clearDelInstanceTime(instanceName);
+
+    try {
+      await this.cleaningUp(instanceName);
+    } catch (error) {
+      this.logger.error(error);
+    }
+
+    try {
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+        const instancePath = join(STORE_DIR, 'chatwoot', instanceName);
+        execFileSync('rm', ['-rf', instancePath]);
+      }
+    } catch (error) {
+      this.logger.error(error);
+    }
+
+    const instance = await this.prismaRepository.instance.findFirst({
+      where: { name: instanceName },
+    });
+
+    if (instance) {
+      await this.prismaRepository.instance.delete({ where: { name: instanceName } });
+    }
+
+    try {
+      delete this.waInstances[instanceName];
+    } catch (error) {
+      this.logger.error(error);
+    }
+
+    this.logger.warn(`Instance "${instanceName}" - FORCE REMOVED`);
+  }
+
   private async setInstance(instanceData: InstanceDto) {
     const instance = channelController.init(instanceData, {
       configService: this.configService,
