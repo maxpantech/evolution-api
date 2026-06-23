@@ -1,0 +1,41 @@
+services:
+  api:
+    container_name: lab_evolution_api
+    image: evolution-api-local
+    restart: always
+    ports:
+      - 8080:8080
+    volumes:
+      - lab_evolution_instances:/lab_evolution/instances
+    networks:
+      - lab_evolution
+    env_file:
+      - .env
+
+  postgres:
+    image: postgres:13
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - lab_evolution
+
+  redis:
+    image: redis:alpine
+    restart: always
+    ports:
+      - "6380:6379"
+    networks:
+      - lab_evolution
+
+volumes:
+  lab_evolution_instances:
+  pg_data:
+
+networks:
+  lab_evolution:
+    driver: bridge

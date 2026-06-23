@@ -271,6 +271,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private historySyncChatCount = 0;
   private historySyncContactCount = 0;
   private historySyncLastProgress = -1;
+  private presenceInterval: NodeJS.Timeout | null = null;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -292,6 +293,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopPresenceInterval();
     // Mark instance as deleting to prevent reconnection attempts.
     this.isDeleting = true;
     this.endSession = true;
@@ -494,6 +496,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      this.stopPresenceInterval();
       // Check if instance is being deleted or session is ending
       if (this.isDeleting || this.endSession) {
         this.logger.info('Instance is being deleted/ended, skipping reconnection attempt');
@@ -597,6 +600,10 @@ export class BaileysStartupService extends ChannelStartupService {
       `,
       );
 
+      // Força presença como unavailable periodicamente para evitar mute das notificações
+      // A presença expira após ~10 segundos, então precisamos renovar periodicamente
+      this.startPresenceInterval();
+
       await this.prismaRepository.instance.update({
         where: { id: this.instanceId },
         data: {
@@ -627,6 +634,42 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+    }
+  }
+
+  private startPresenceInterval() {
+    // Limpa interval anterior se existir
+    this.stopPresenceInterval();
+
+    // Envia presença unavailable imediatamente após 3 segundos (aguarda nome estar disponível)
+    setTimeout(async () => {
+      await this.sendUnavailablePresence();
+    }, 3000);
+
+    // Renova a presença a cada 5 segundos (expira em ~10s)
+    this.presenceInterval = setInterval(async () => {
+      await this.sendUnavailablePresence();
+    }, 5000);
+
+    this.logger.info('Presence interval started - keeping device notifications active');
+  }
+
+  private stopPresenceInterval() {
+    if (this.presenceInterval) {
+      clearInterval(this.presenceInterval);
+      this.presenceInterval = null;
+      this.logger.info('Presence interval stopped');
+    }
+  }
+
+  private async sendUnavailablePresence() {
+    try {
+      // Só envia unavailable se alwaysOnline estiver desabilitado
+      if (this.client && this.stateConnection.state === 'open' && !this.localSettings.alwaysOnline) {
+        await this.client.sendPresenceUpdate('unavailable');
+      }
+    } catch (error) {
+      this.logger.warn('Erro ao definir presença como unavailable: ' + error?.message);
     }
   }
 
@@ -770,7 +813,8 @@ export class BaileysStartupService extends ChannelStartupService {
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       // Removido browserOptions para usar Multi-Device nativo (não WebClient)
-      markOnlineOnConnect: this.localSettings.alwaysOnline,
+      // markOnlineOnConnect:false mantém o push das notificações no celular do dono
+      markOnlineOnConnect: false,
       retryRequestDelayMs: 350,
       maxMsgRetryCount: 4,
       fireInitQueries: true,
