@@ -251,6 +251,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private presenceInterval: NodeJS.Timeout | null = null;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -265,6 +266,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopPresenceInterval();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -424,6 +426,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      this.stopPresenceInterval();
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
@@ -486,6 +489,10 @@ export class BaileysStartupService extends ChannelStartupService {
         name: ${formattedName}
       `,
       );
+
+      // Força presença como unavailable periodicamente para evitar mute das notificações
+      // A presença expira após ~10 segundos, então precisamos renovar periodicamente
+      this.startPresenceInterval();
 
       await this.prismaRepository.instance.update({
         where: { id: this.instanceId },
@@ -648,7 +655,8 @@ export class BaileysStartupService extends ChannelStartupService {
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
-      markOnlineOnConnect: this.localSettings.alwaysOnline,
+      // markOnlineOnConnect:false mantém o push das notificações no celular do dono
+      markOnlineOnConnect: false,
       retryRequestDelayMs: 350,
       maxMsgRetryCount: 4,
       fireInitQueries: true,
@@ -718,6 +726,42 @@ export class BaileysStartupService extends ChannelStartupService {
     this.phoneNumber = number;
 
     return this.client;
+  }
+
+  private startPresenceInterval() {
+    // Limpa interval anterior se existir
+    this.stopPresenceInterval();
+
+    // Envia presença unavailable imediatamente após 3 segundos (aguarda nome estar disponível)
+    setTimeout(async () => {
+      await this.sendUnavailablePresence();
+    }, 3000);
+
+    // Renova a presença a cada 5 segundos (expira em ~10s)
+    this.presenceInterval = setInterval(async () => {
+      await this.sendUnavailablePresence();
+    }, 5000);
+
+    this.logger.info('Presence interval started - keeping device notifications active');
+  }
+
+  private stopPresenceInterval() {
+    if (this.presenceInterval) {
+      clearInterval(this.presenceInterval);
+      this.presenceInterval = null;
+      this.logger.info('Presence interval stopped');
+    }
+  }
+
+  private async sendUnavailablePresence() {
+    try {
+      // Só envia unavailable se alwaysOnline estiver desabilitado
+      if (this.client && this.stateConnection.state === 'open' && !this.localSettings.alwaysOnline) {
+        await this.client.sendPresenceUpdate('unavailable');
+      }
+    } catch (error) {
+      this.logger.warn('Erro ao definir presença como unavailable: ' + error?.message);
+    }
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
