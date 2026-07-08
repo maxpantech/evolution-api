@@ -17,8 +17,13 @@ function createPrismaAdapter(connectionString: string) {
   if (provider === 'mysql') {
     return new PrismaMariaDb(connectionString);
   }
-  // postgresql e psql_bouncer usam o adapter do Postgres
-  return new PrismaPg(connectionString);
+  // postgresql e psql_bouncer usam o adapter do Postgres.
+  // O driver `pg` não interpreta sslmode=require da connection string como o
+  // libpq (cifra sem verificar a cadeia) — sem ssl explícito ele faz
+  // verificação estrita e rejeita o certificado da RDS como "self-signed".
+  // Replicamos o mesmo nível de confiança do libpq (encrypt, don't verify).
+  const requiresTls = /sslmode=(require|prefer|verify-ca|verify-full)/.test(connectionString);
+  return new PrismaPg(requiresTls ? { connectionString, ssl: { rejectUnauthorized: false } } : connectionString);
 }
 
 export class PrismaRepository extends PrismaClient {
