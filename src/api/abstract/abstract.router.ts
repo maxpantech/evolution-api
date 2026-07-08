@@ -46,12 +46,23 @@ export abstract class RouterBroker {
     const body = request.body;
     const instance = request.params as unknown as InstanceDto;
 
+    // Only routes with a path-based :instanceName carry a pre-authenticated
+    // instance identity that query/body could override (the CVE this guards
+    // against). Flat admin routes with no :instanceName (e.g.
+    // /instance/fetchInstances?instanceId=, /instance/create) have nothing to
+    // protect — instanceId/instanceName there are legitimate filters/inputs,
+    // not overrides, and must not be stripped.
+    const hasAuthenticatedInstanceIdentity = Boolean((request.params as Record<string, unknown>)?.instanceName);
+
     if (request?.query && Object.keys(request.query).length > 0) {
-      Object.assign(instance, sanitizeUntrustedInput(request.query as Record<string, any>));
+      Object.assign(
+        instance,
+        hasAuthenticatedInstanceIdentity ? sanitizeUntrustedInput(request.query as Record<string, any>) : request.query,
+      );
     }
 
     if (request.originalUrl.includes('/instance/create')) {
-      Object.assign(instance, sanitizeUntrustedInput(body));
+      Object.assign(instance, hasAuthenticatedInstanceIdentity ? sanitizeUntrustedInput(body) : body);
     }
 
     Object.assign(ref, body);
