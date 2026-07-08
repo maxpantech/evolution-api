@@ -18,12 +18,18 @@ function createPrismaAdapter(connectionString: string) {
     return new PrismaMariaDb(connectionString);
   }
   // postgresql e psql_bouncer usam o adapter do Postgres.
-  // O driver `pg` não interpreta sslmode=require da connection string como o
-  // libpq (cifra sem verificar a cadeia) — sem ssl explícito ele faz
-  // verificação estrita e rejeita o certificado da RDS como "self-signed".
-  // Replicamos o mesmo nível de confiança do libpq (encrypt, don't verify).
+  // pg-connection-string (usado pelo @prisma/adapter-pg) trata sslmode=require
+  // como alias de verify-full, não como o libpq clássico (cifra sem verificar
+  // a cadeia) — rejeita o certificado da RDS como "self-signed certificate in
+  // certificate chain". Um objeto `ssl` explícito por cima NÃO sobrepõe esse
+  // parsing (testado). uselibpqcompat=true restaura a semântica clássica do
+  // libpq pro sslmode=require, como o próprio pg recomenda no aviso de
+  // deprecação. Ver: https://github.com/brianc/node-postgres/pull/3392
   const requiresTls = /sslmode=(require|prefer|verify-ca|verify-full)/.test(connectionString);
-  return new PrismaPg(requiresTls ? { connectionString, ssl: { rejectUnauthorized: false } } : connectionString);
+  const finalConnectionString = requiresTls
+    ? `${connectionString}${connectionString.includes('?') ? '&' : '?'}uselibpqcompat=true`
+    : connectionString;
+  return new PrismaPg(finalConnectionString);
 }
 
 export class PrismaRepository extends PrismaClient {
