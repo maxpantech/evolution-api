@@ -71,6 +71,7 @@ import {
   Chatwoot,
   ConfigService,
   configService,
+  ConfigSessionPhone,
   Database,
   Log,
   Openai,
@@ -129,6 +130,7 @@ import makeWASocket, {
   Product,
   proto,
   UserFacingSocketConfig,
+  WABrowserDescription,
   WAMediaUpload,
   WAMessage,
   WAMessageKey,
@@ -148,6 +150,7 @@ import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
 import cron from 'node-cron';
+import { release } from 'os';
 import { join } from 'path';
 import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
@@ -721,6 +724,13 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info(`Phone number: ${number}`);
     }
 
+    // Linked-device name shown in WhatsApp's "Linked Devices" list. Without
+    // this, Baileys falls back to its own hardcoded default (Browsers.macOS
+    // ('Chrome') => "Google Chrome (Mac OS)"), unrelated to the actual server.
+    const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
+    const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
+    this.logger.info(`Browser: ${browser}`);
+
     // Fetch latest WhatsApp Web version automatically
     const baileysVersion = await fetchLatestWaWebVersion({}, this.cache);
     const version = baileysVersion.version;
@@ -775,6 +785,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const socketConfig: UserFacingSocketConfig = {
       ...options,
       version,
+      browser,
       logger: P({ level: this.logBaileys }),
       printQRInTerminal: false,
       auth: {
