@@ -253,6 +253,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private presenceInterval: NodeJS.Timeout | null = null;
 
+  // Erro 463 (LID addressing): cache negativo de PNs sem mapeamento LID, para não
+  // repetir USync a cada envio — getLIDForPN consulta a rede quando não há mapping local.
+  private readonly lidUnmappedPns = new Map<string, number>();
+  private static readonly LID_UNMAPPED_TTL_MS = 6 * 60 * 60 * 1000;
+  private static readonly LID_UNMAPPED_CACHE_MAX = 5_000;
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -1971,7 +1977,9 @@ export class BaileysStartupService extends ChannelStartupService {
                           jidOptions: { contains: call.from },
                         },
                       });
-                      this.logger.debug(`[CALL] Direct DB result for ${call.from}: ${JSON.stringify(isOnWhatsappRecord)}`);
+                      this.logger.debug(
+                        `[CALL] Direct DB result for ${call.from}: ${JSON.stringify(isOnWhatsappRecord)}`,
+                      );
 
                       if (isOnWhatsappRecord?.jidOptions) {
                         const jidOptions = isOnWhatsappRecord.jidOptions.split(',');
@@ -2455,6 +2463,37 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
+  // Contatos já migrados para LID rejeitam stanzas 1:1 endereçadas ao PN com o erro
+  // assíncrono 463 (a resposta HTTP sai 201/PENDING e o servidor NACKa depois) — o
+  // WhatsApp Web oficial endereça pelo @lid nesses casos. Resolve o LID mapeado
+  // (local ou via USync) para usá-lo como destino; null quando o contato não tem LID.
+  private async resolveSendLid(sender: string): Promise<string | null> {
+    if (!sender.endsWith('@s.whatsapp.net')) return null;
+
+    const missCachedAt = this.lidUnmappedPns.get(sender);
+    if (missCachedAt && Date.now() - missCachedAt < BaileysStartupService.LID_UNMAPPED_TTL_MS) {
+      return null;
+    }
+
+    try {
+      const lid = await this.client.signalRepository.lidMapping.getLIDForPN(sender);
+      if (lid && lid.includes('@lid')) {
+        this.lidUnmappedPns.delete(sender);
+        return lid;
+      }
+    } catch (error) {
+      // Falha transitória (ex.: USync timeout) não entra no cache negativo.
+      this.logger.warn(`resolveSendLid: getLIDForPN failed for ${sender}: ${error?.message}`);
+      return null;
+    }
+
+    while (this.lidUnmappedPns.size >= BaileysStartupService.LID_UNMAPPED_CACHE_MAX) {
+      this.lidUnmappedPns.delete(this.lidUnmappedPns.keys().next().value);
+    }
+    this.lidUnmappedPns.set(sender, Date.now());
+    return null;
+  }
+
   private async sendMessageWithTyping<T = proto.IMessage>(
     number: string,
     message: T,
@@ -2522,6 +2561,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       let messageSent: WAMessage;
+      let lidSender: string | null = null;
 
       let mentions: string[];
       let contextInfo: any;
@@ -2575,8 +2615,14 @@ export class BaileysStartupService extends ChannelStartupService {
           },
           disappearingMode: { initiator: 0 },
         };
+
+        lidSender = await this.resolveSendLid(sender);
+        if (lidSender) {
+          this.logger.verbose(`LID routing: sending to ${lidSender} instead of ${sender}`);
+        }
+
         messageSent = await this.sendMessage(
-          sender,
+          lidSender ?? sender,
           message,
           mentions,
           linkPreview,
@@ -2591,7 +2637,15 @@ export class BaileysStartupService extends ChannelStartupService {
         messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
       }
 
-      const messageRaw = this.prepareMessage(messageSent);
+      // Mesma convenção do caminho de recebimento (messages.upsert): remoteJid guarda o
+      // PN e remoteJidAlt o @lid, preservando a correlação por telefone em DB/webhooks/Chatwoot.
+      if (lidSender && messageSent?.key?.remoteJid?.includes('@lid')) {
+        (messageSent.key as any).remoteJidAlt = messageSent.key.remoteJid;
+        messageSent.key.remoteJid = sender;
+        (messageSent.key as any).addressingMode = 'pn';
+      }
+
+      const messageRaw = this.prepareMessage(messageSent) as any;
 
       const isMedia =
         messageSent?.message?.imageMessage ||
