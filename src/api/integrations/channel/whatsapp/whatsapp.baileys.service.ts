@@ -246,8 +246,12 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
-  private readonly msgRetryCounterCache: CacheStore = new NodeCache();
-  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
+  // TTL bounded to avoid unbounded growth: these caches are keyed per distinct
+  // contact/message and previously had no (or an effectively multi-day) expiry,
+  // so across ~440 concurrent instances in one process they never emptied
+  // within a normal uptime and drove the Node heap to OOM.
+  private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 600, checkperiod: 120 });
+  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 21600, checkperiod: 600, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
