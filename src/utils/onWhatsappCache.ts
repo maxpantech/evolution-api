@@ -94,24 +94,30 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
 
       const expandedJids = baseJids.flatMap((jid) => getAvailableNumbers(jid));
 
-      // 1. Busca entrada por jidOptions e também remoteJid
-      // Às vezes acontece do remoteJid atual NÃO ESTAR no jidOptions ainda, ocasionando o erro:
-      // 'Unique constraint failed on the fields: (`remoteJid`)'
+      // 1. Busca primeiro pelo remoteJid exato (índice único), que resolve a grande maioria dos casos.
+      // Buscar só por jidOptions também falhava quando o remoteJid atual NÃO ESTAVA no jidOptions ainda,
+      // ocasionando o erro: 'Unique constraint failed on the fields: (`remoteJid`)'
       // Isso acontece principalmente em grupos que possuem o número do criador no ID (ex.: '559911223345-1234567890@g.us')
-      const existingRecord = await prismaRepository.isOnWhatsapp.findFirst({
-        where: {
-          OR: [
-            ...expandedJids.map((jid) => ({ jidOptions: { contains: jid } })),
-            { remoteJid: remoteJid }, // TODO: Descobrir o motivo que causa o remoteJid não estar (às vezes) incluso na lista de jidOptions
-          ],
-        },
+      let existingRecord = await prismaRepository.isOnWhatsapp.findUnique({
+        where: { remoteJid: remoteJid },
       });
+
+      // 2. Só então procura pelas variações em jidOptions (LIKE '%jid%'). Sem LIMIT de propósito:
+      // com findFirst (LIMIT 1) o Postgres escolhe seq scan na tabela inteira em vez do índice trigram.
+      if (!existingRecord) {
+        const candidates = await prismaRepository.isOnWhatsapp.findMany({
+          where: {
+            OR: expandedJids.map((jid) => ({ jidOptions: { contains: jid } })),
+          },
+        });
+        existingRecord = candidates[0] ?? null;
+      }
 
       logger.verbose(
         `[saveOnWhatsappCache] Register exists for [${expandedJids.join(',')}]? => ${existingRecord ? existingRecord.remoteJid : 'Not found'}`,
       );
 
-      // 2. Unifica todos os JIDs usando um Set para garantir valores únicos
+      // 3. Unifica todos os JIDs usando um Set para garantir valores únicos
       const finalJidOptions = new Set(expandedJids);
 
       if (lidAltJid) {
@@ -122,7 +128,7 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
         existingRecord.jidOptions.split(',').forEach((jid) => finalJidOptions.add(jid));
       }
 
-      // 3. Prepara o payload final
+      // 4. Prepara o payload final
       // Ordena os JIDs para garantir consistência na string final
       const sortedJidOptions = [...finalJidOptions].sort();
       const newJidOptionsString = sortedJidOptions.join(',');
@@ -134,7 +140,7 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
         lid: newLid,
       };
 
-      // 4. Decide entre Criar ou Atualizar
+      // 5. Decide entre Criar ou Atualizar
       if (existingRecord) {
         // Compara a string de JIDs ordenada existente com a nova
         const existingJidOptionsString = existingRecord.jidOptions
