@@ -257,6 +257,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private presenceInterval: NodeJS.Timeout | null = null;
 
+  // Uma instância só pode ter uma socket viva. Duas sockets com a mesma sessão se derrubam pelo WhatsApp
+  // (stream:error conflict/replaced, 440) e, como o 'close' de cada uma reconectava, o loop só parava no restart.
+  private unsubscribeClientEvents: (() => void) | null = null;
+  private connectInFlight: Promise<WASocket> | null = null;
+  private static readonly CONNECTION_REPLACED_RECONNECT_DELAY_MS = 10_000;
+
   // Erro 463 (LID addressing): cache negativo de PNs sem mapeamento LID, para não
   // repetir USync a cada envio — getLIDForPN consulta a rede quando não há mapping local.
   private readonly lidUnmappedPns = new Map<string, number>();
@@ -440,7 +446,22 @@ export class BaileysStartupService extends ChannelStartupService {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
-      if (shouldReconnect) {
+      if (shouldReconnect && statusCode === DisconnectReason.connectionReplaced) {
+        // 440: outra socket abriu com a mesma sessão. Reconectar na hora derrubaria a outra, que reconectaria
+        // e derrubaria esta de volta. Espera um pouco e só reconecta se ninguém reabriu a conexão nesse meio-tempo.
+        const delayMs = BaileysStartupService.CONNECTION_REPLACED_RECONNECT_DELAY_MS;
+        this.logger.error(
+          `[${this.instance.name}] Conexão substituída por outra sessão (440 conflict/replaced); reconectando em ${delayMs / 1000}s`,
+        );
+        setTimeout(() => {
+          if (this.stateConnection.state !== 'close' || this.endSession) {
+            return;
+          }
+          this.connectToWhatsapp(this.phoneNumber).catch((error) =>
+            this.logger.error(`[${this.instance.name}] Falha ao reconectar após 440: ${error?.message}`),
+          );
+        }, delayMs);
+      } else if (shouldReconnect) {
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -713,6 +734,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    this.endPreviousClient();
     this.client = makeWASocket(socketConfig);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
@@ -736,6 +758,25 @@ export class BaileysStartupService extends ChannelStartupService {
     this.phoneNumber = number;
 
     return this.client;
+  }
+
+  // Desliga os eventos e encerra a socket anterior antes de criar outra. O unsubscribe vem antes do end()
+  // de propósito: o 'close' que o end() emite não pode disparar mais uma reconexão.
+  private endPreviousClient() {
+    const previous = this.client;
+
+    this.unsubscribeClientEvents?.();
+    this.unsubscribeClientEvents = null;
+
+    if (!previous) {
+      return;
+    }
+
+    try {
+      previous.end(undefined);
+    } catch (error) {
+      this.logger.warn(`[${this.instance.name}] Erro ao encerrar a socket anterior: ${error?.message}`);
+    }
   }
 
   private startPresenceInterval() {
@@ -775,6 +816,20 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    // A reconexão automática do 'close' e uma chamada da API (/instance/restart, /instance/connect) podem chegar
+    // juntas; a segunda reaproveita a conexão em andamento em vez de abrir outra socket.
+    if (this.connectInFlight) {
+      return this.connectInFlight;
+    }
+
+    this.connectInFlight = this.openConnection(number).finally(() => {
+      this.connectInFlight = null;
+    });
+
+    return this.connectInFlight;
+  }
+
+  private async openConnection(number?: string): Promise<WASocket> {
     try {
       this.loadChatwoot();
       this.loadSettings();
@@ -1927,10 +1982,17 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
-    this.client.ev.process(async (events) => {
+    const socket = this.client;
+
+    this.unsubscribeClientEvents = socket.ev.process(async (events) => {
+      // Eventos de uma socket já substituída são descartados: um 'close' atrasado dela reabriria a conexão.
+      if (socket !== this.client) {
+        return;
+      }
+
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
-          if (!this.endSession) {
+          if (!this.endSession && socket === this.client) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
 
