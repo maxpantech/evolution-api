@@ -83,7 +83,7 @@ export class WAMonitoringService {
     }
   }
 
-  public async instanceInfo(instanceNames?: string[]): Promise<any> {
+  public async instanceInfo(instanceNames?: string[], options: { withCounts?: boolean } = {}): Promise<any> {
     if (instanceNames && instanceNames.length > 0) {
       const inexistentInstances = instanceNames ? instanceNames.filter((instance) => !this.waInstances[instance]) : [];
 
@@ -116,20 +116,48 @@ export class WAMonitoringService {
         Sqs: true,
         Websocket: true,
         Setting: true,
-        _count: {
-          select: {
-            Message: true,
-            Contact: true,
-            Chat: true,
-          },
-        },
       },
     });
 
-    return instances;
+    if (!options.withCounts) {
+      return instances;
+    }
+
+    const counts = await this.countRelationsByInstance(instances.map((instance) => instance.id));
+
+    return instances.map((instance) => ({
+      ...instance,
+      _count: counts.get(instance.id),
+    }));
   }
 
-  public async instanceInfoById(instanceId?: string, number?: string) {
+  // O include `_count` do Prisma gera `LEFT JOIN (SELECT "instanceId", COUNT(*) FROM "Contact" WHERE 1=1
+  // GROUP BY "instanceId")`: conta as tabelas inteiras a cada chamada, mesmo quando só uma instância foi
+  // pedida. Aqui cada contagem filtra pelos instanceIds pedidos e usa o índice de instanceId.
+  private async countRelationsByInstance(instanceIds: string[]) {
+    const counts = new Map<string, { Message: number; Contact: number; Chat: number }>(
+      instanceIds.map((id) => [id, { Message: 0, Contact: 0, Chat: 0 }]),
+    );
+
+    if (instanceIds.length === 0) {
+      return counts;
+    }
+
+    const where = { instanceId: { in: instanceIds } };
+    const [messages, contacts, chats] = await Promise.all([
+      this.prismaRepository.message.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+      this.prismaRepository.contact.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+      this.prismaRepository.chat.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+    ]);
+
+    messages.forEach((row) => (counts.get(row.instanceId).Message = row._count._all));
+    contacts.forEach((row) => (counts.get(row.instanceId).Contact = row._count._all));
+    chats.forEach((row) => (counts.get(row.instanceId).Chat = row._count._all));
+
+    return counts;
+  }
+
+  public async instanceInfoById(instanceId?: string, number?: string, options: { withCounts?: boolean } = {}) {
     let instanceName: string;
     if (instanceId) {
       instanceName = await this.prismaRepository.instance.findFirst({ where: { id: instanceId } }).then((r) => r?.name);
@@ -153,7 +181,7 @@ export class WAMonitoringService {
 
     const instanceNames = instanceName ? [instanceName] : null;
 
-    return this.instanceInfo(instanceNames);
+    return this.instanceInfo(instanceNames, options);
   }
 
   public async cleaningUp(instanceName: string) {
