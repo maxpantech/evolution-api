@@ -56,12 +56,14 @@ export class InstanceRouter extends RouterBroker {
       })
       .get(this.routerPath('fetchInstances', false), ...guards, async (req, res) => {
         const key = req.get('apikey');
+        // Contagem de Message/Contact/Chat por instância só quando pedida explicitamente (?withCounts=true).
+        const withCounts = req.query?.withCounts === 'true';
 
         const response = await this.dataValidate<InstanceDto>({
           request: req,
           schema: null,
           ClassRef: InstanceDto,
-          execute: (instance) => instanceController.fetchInstances(instance, key),
+          execute: (instance) => instanceController.fetchInstances(instance, key, withCounts),
         });
 
         return res.status(HttpStatus.OK).json(response);
