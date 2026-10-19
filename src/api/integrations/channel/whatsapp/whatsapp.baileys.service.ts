@@ -261,7 +261,19 @@ export class BaileysStartupService extends ChannelStartupService {
   // (stream:error conflict/replaced, 440) e, como o 'close' de cada uma reconectava, o loop só parava no restart.
   private unsubscribeClientEvents: (() => void) | null = null;
   private connectInFlight: Promise<WASocket> | null = null;
-  private static readonly CONNECTION_REPLACED_RECONNECT_DELAY_MS = 10_000;
+
+  // Reconexão com espera: um timer por instância, e a espera cresce a cada queda seguida do mesmo tipo.
+  // As sequências zeram quando a conexão fica aberta por STABLE_CONNECTION_MS.
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private stableConnectionTimer: NodeJS.Timeout | null = null;
+  private replacedStreak = 0;
+  private reconnectFailureStreak = 0;
+  // logout/exclusão: nenhuma reconexão agendada pode reabrir a instância depois disso.
+  private disposed = false;
+  private static readonly REPLACED_BACKOFF_BASE_MS = 10_000;
+  private static readonly RECONNECT_FAILURE_BACKOFF_BASE_MS = 5_000;
+  private static readonly RECONNECT_BACKOFF_MAX_MS = 5 * 60_000;
+  private static readonly STABLE_CONNECTION_MS = 2 * 60_000;
 
   // Erro 463 (LID addressing): cache negativo de PNs sem mapeamento LID, para não
   // repetir USync a cada envio — getLIDForPN consulta a rede quando não há mapping local.
@@ -282,6 +294,9 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.disposed = true;
+    this.clearReconnectTimer();
+    this.clearStableConnectionTimer();
     this.stopPresenceInterval();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
@@ -446,23 +461,24 @@ export class BaileysStartupService extends ChannelStartupService {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
-      if (shouldReconnect && statusCode === DisconnectReason.connectionReplaced) {
-        // 440: outra socket abriu com a mesma sessão. Reconectar na hora derrubaria a outra, que reconectaria
-        // e derrubaria esta de volta. Espera um pouco e só reconecta se ninguém reabriu a conexão nesse meio-tempo.
-        const delayMs = BaileysStartupService.CONNECTION_REPLACED_RECONNECT_DELAY_MS;
-        this.logger.error(
-          `[${this.instance.name}] Conexão substituída por outra sessão (440 conflict/replaced); reconectando em ${delayMs / 1000}s`,
-        );
-        setTimeout(() => {
-          if (this.stateConnection.state !== 'close' || this.endSession) {
-            return;
-          }
-          this.connectToWhatsapp(this.phoneNumber).catch((error) =>
-            this.logger.error(`[${this.instance.name}] Falha ao reconectar após 440: ${error?.message}`),
+      if (shouldReconnect) {
+        this.clearStableConnectionTimer();
+        // O banco passa a refletir a queda antes de reconectar. Sem isso, uma reconexão que falhava ou demorava
+        // deixava a instância 'close' em memória e 'open' no banco: o painel mostrava conectado e os envios falhavam.
+        await this.persistConnectionDrop(statusCode, lastDisconnect);
+
+        if (statusCode === DisconnectReason.connectionReplaced) {
+          // 440: outra socket abriu com a mesma sessão. Reconectar na hora derrubaria a outra, que reconectaria
+          // e derrubaria esta de volta. A espera dobra a cada 440 seguido (10s, 20s, 40s... até 5min), então uma
+          // sessão aberta em outro servidor deixa de brigar a cada segundo e o log mostra qual instância é.
+          const delayMs = this.nextBackoffMs('replaced');
+          this.logger.error(
+            `[${this.instance.name}] Conexão substituída por outra sessão (440 conflict/replaced, ${this.replacedStreak}ª seguida); reconectando em ${delayMs / 1000}s`,
           );
-        }, delayMs);
-      } else if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+          this.scheduleReconnect(delayMs);
+        } else {
+          await this.reconnectNow();
+        }
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -499,6 +515,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.markConnectionOpened();
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -760,6 +777,82 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.client;
   }
 
+  private async persistConnectionDrop(statusCode: number, lastDisconnect: any) {
+    try {
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: {
+          connectionStatus: 'close',
+          disconnectionAt: new Date(),
+          disconnectionReasonCode: statusCode,
+          disconnectionObject: JSON.stringify(lastDisconnect),
+        },
+      });
+    } catch (error) {
+      this.logger.warn(`[${this.instance.name}] Não foi possível gravar a queda da conexão: ${error?.message}`);
+    }
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+  }
+
+  private nextBackoffMs(kind: 'replaced' | 'failure') {
+    const streak = kind === 'replaced' ? ++this.replacedStreak : ++this.reconnectFailureStreak;
+    const base =
+      kind === 'replaced'
+        ? BaileysStartupService.REPLACED_BACKOFF_BASE_MS
+        : BaileysStartupService.RECONNECT_FAILURE_BACKOFF_BASE_MS;
+    return Math.min(base * 2 ** (streak - 1), BaileysStartupService.RECONNECT_BACKOFF_MAX_MS);
+  }
+
+  // Reconecta já; se a tentativa falhar, agenda outra com espera em vez de largar a instância fechada para sempre.
+  private async reconnectNow() {
+    try {
+      await this.connectToWhatsapp(this.phoneNumber);
+    } catch (error) {
+      const delayMs = this.nextBackoffMs('failure');
+      this.logger.error(
+        `[${this.instance.name}] Falha ao reconectar (${this.reconnectFailureStreak}ª seguida): ${error?.message}; nova tentativa em ${delayMs / 1000}s`,
+      );
+      this.scheduleReconnect(delayMs);
+    }
+  }
+
+  private scheduleReconnect(delayMs: number) {
+    this.clearReconnectTimer();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      // Alguém já reabriu (API, outra reconexão) ou a instância foi encerrada: não abre outra socket.
+      if (this.disposed || this.endSession || this.stateConnection.state !== 'close') {
+        return;
+      }
+      this.reconnectNow();
+    }, delayMs);
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private clearStableConnectionTimer() {
+    if (this.stableConnectionTimer) {
+      clearTimeout(this.stableConnectionTimer);
+      this.stableConnectionTimer = null;
+    }
+  }
+
+  // Conexão aberta: cancela reconexão pendente e, se ela ficar de pé por um tempo, zera as sequências de espera.
+  private markConnectionOpened() {
+    this.clearReconnectTimer();
+    this.reconnectFailureStreak = 0;
+    this.clearStableConnectionTimer();
+    this.stableConnectionTimer = setTimeout(() => {
+      this.stableConnectionTimer = null;
+      this.replacedStreak = 0;
+    }, BaileysStartupService.STABLE_CONNECTION_MS);
+  }
+
   // Desliga os eventos e encerra a socket anterior antes de criar outra. O unsubscribe vem antes do end()
   // de propósito: o 'close' que o end() emite não pode disparar mais uma reconexão.
   private endPreviousClient() {
@@ -850,7 +943,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async reloadConnection(): Promise<WASocket> {
     try {
-      return await this.createClient(this.phoneNumber);
+      // Mesma trava do connectToWhatsapp: privacidade/foto de perfil chamando junto de uma reconexão não abre
+      // uma segunda socket.
+      if (this.connectInFlight) {
+        return await this.connectInFlight;
+      }
+      this.connectInFlight = this.createClient(this.phoneNumber).finally(() => {
+        this.connectInFlight = null;
+      });
+      return await this.connectInFlight;
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());

@@ -483,6 +483,16 @@ export class WAMonitoringService {
         });
       } finally {
         this.logger.warn(`Instance "${instanceName}" - NOT CONNECTION`);
+        // Limite de QR atingido: a instância fica fechada em memória, e o banco precisa dizer o mesmo. Antes ele
+        // ficava com o último status gravado ('connecting'/'open'), e quem lê o banco via a instância como viva.
+        await this.prismaRepository.instance
+          .updateMany({
+            where: { name: instanceName },
+            data: { connectionStatus: 'close', disconnectionAt: new Date() },
+          })
+          .catch((error) =>
+            this.logger.error(`Instance "${instanceName}" - falha ao gravar close no banco: ${error?.message}`),
+          );
       }
     });
   }
