@@ -1018,6 +1018,13 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
+        // A sincronização de contatos (conexão/reconexão, history sync) chega em lotes de milhares de
+        // contatos. Com DATABASE_SAVE_DATA_CONTACTS=false nada disso é persistido, então não vale disparar
+        // uma consulta na IsOnWhatsapp e uma busca de foto de perfil por contato, todas em paralelo:
+        // isso esgotava o pool do Prisma (P2024) e saturava a CPU do Postgres a cada sincronização.
+        const saveContacts = this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS;
+        const chatwootEnabled = this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled;
+
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
           pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
@@ -1028,12 +1035,13 @@ export class BaileysStartupService extends ChannelStartupService {
         if (contactsRaw.length > 0) {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
+          if (saveContacts) {
             await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
 
-          const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
-          if (usersContacts) {
-            await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
+            const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
+            if (usersContacts) {
+              await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
+            }
           }
         }
 
@@ -1053,6 +1061,11 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
+        // O enriquecimento abaixo só serve para gravar a foto no Contact e atualizar o avatar no Chatwoot.
+        if (!saveContacts && !chatwootEnabled) {
+          return;
+        }
+
         const updatedContacts = await Promise.all(
           contacts.map(async (contact) => ({
             remoteJid: contact.id,
@@ -1063,22 +1076,18 @@ export class BaileysStartupService extends ChannelStartupService {
         );
 
         if (updatedContacts.length > 0) {
-          const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
-          if (usersContacts) {
-            await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
-          }
-
+          // Sem um segundo saveOnWhatsappCache aqui: são os mesmos remoteJids já gravados acima.
           this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
           await Promise.all(
             updatedContacts.map(async (contact) => {
-              if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+              if (saveContacts) {
                 await this.prismaRepository.contact.updateMany({
                   where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
                   data: { profilePicUrl: contact.profilePicUrl },
                 });
               }
 
-              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+              if (chatwootEnabled) {
                 const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
 
                 const findParticipant = await this.chatwootService.findContact(
