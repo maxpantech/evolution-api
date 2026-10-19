@@ -399,7 +399,7 @@ export class InstanceController {
     };
   }
 
-  public async fetchInstances({ instanceName, instanceId, number }: InstanceDto, key: string) {
+  public async fetchInstances({ instanceName, instanceId, number }: InstanceDto, key: string, withCounts = false) {
     const env = this.configService.get<Auth>('AUTHENTICATION').API_KEY;
 
     if (env.KEY !== key) {
@@ -414,19 +414,19 @@ export class InstanceController {
       if (instancesByKey.length > 0) {
         const names = instancesByKey.map((instance) => instance.name);
 
-        return this.waMonitor.instanceInfo(names);
+        return this.waMonitor.instanceInfo(names, { withCounts });
       } else {
         throw new UnauthorizedException();
       }
     }
 
     if (instanceId || number) {
-      return this.waMonitor.instanceInfoById(instanceId, number);
+      return this.waMonitor.instanceInfoById(instanceId, number, { withCounts });
     }
 
     const instanceNames = instanceName ? [instanceName] : null;
 
-    return this.waMonitor.instanceInfo(instanceNames);
+    return this.waMonitor.instanceInfo(instanceNames, { withCounts });
   }
 
   public async setPresence({ instanceName }: InstanceDto, data: SetPresenceDto) {
