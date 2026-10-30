@@ -14,7 +14,15 @@ import { join } from 'path';
 
 import { CacheService } from './cache.service';
 
+type BootInstance = InstanceDto & { disconnectionReasonCode?: number | null };
+
 export class WAMonitoringService {
+  // Quedas passageiras: a sessão segue válida e a instância deve voltar no boot mesmo se o banco ficou 'close'.
+  // Ficam de fora as definitivas (401 logout, 403, 402, 406) e o 'close' sem motivo (ex.: limite de QR).
+  private static readonly TRANSIENT_DISCONNECT_CODES = [408, 428, 440, 500, 503, 515];
+  private static readonly BOOT_CONNECT_CONCURRENCY = 20;
+  private static readonly BOOT_CONNECT_TIMEOUT_MS = 30_000;
+
   constructor(
     private readonly eventEmitter: EventEmitter2,
     private readonly configService: ConfigService,
@@ -339,7 +347,8 @@ export class WAMonitoringService {
     this.logger.warn(`Instance "${instanceName}" - FORCE REMOVED`);
   }
 
-  private async setInstance(instanceData: InstanceDto) {
+  // Registra a instância em memória sem conectar; a conexão do boot fica a cargo do connectOnBoot.
+  private registerInstance(instanceData: BootInstance) {
     const instance = channelController.init(instanceData, {
       configService: this.configService,
       eventEmitter: this.eventEmitter,
@@ -362,48 +371,122 @@ export class WAMonitoringService {
       ownerJid: instanceData.ownerJid,
     });
 
+    this.waInstances[instanceData.instanceName] = instance;
+
+    return instance;
+  }
+
+  // Reconecta no boot quem estava conectado (open/connecting) e também quem ficou 'close' por uma queda passageira:
+  // a sessão continua válida, só faltou alguém reabrir. Sem isso, uma task morta no meio das reconexões deixa a
+  // instância fora até alguém chamar /instance/connect (incidente de 30/10/2026: 394 instâncias, nem o rollback voltou).
+  private shouldAutoConnect(instanceData: BootInstance) {
     if (instanceData.connectionStatus === 'open' || instanceData.connectionStatus === 'connecting') {
-      this.logger.info(
-        `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
-      );
-      await instance.connectToWhatsapp();
-    } else {
-      this.logger.info(
-        `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
-      );
+      return true;
     }
 
-    this.waInstances[instanceData.instanceName] = instance;
+    return (
+      instanceData.connectionStatus === 'close' &&
+      WAMonitoringService.TRANSIENT_DISCONNECT_CODES.includes(instanceData.disconnectionReasonCode)
+    );
+  }
+
+  private async setInstances(instancesData: BootInstance[]) {
+    const toConnect: { instanceData: BootInstance; instance: any }[] = [];
+
+    for (const instanceData of instancesData) {
+      const instance = this.registerInstance(instanceData);
+      if (!instance) continue;
+
+      if (this.shouldAutoConnect(instanceData)) {
+        toConnect.push({ instanceData, instance });
+      } else {
+        this.logger.info(
+          `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
+        );
+      }
+    }
+
+    await this.connectOnBoot(toConnect);
+  }
+
+  // Conectar as ~500 instâncias de uma vez (handshake, sync inicial e fetch da versão do WhatsApp Web de todas ao
+  // mesmo tempo) travava a CPU por minutos: as sockets caíam por timeout (408) e o health check matava a task.
+  // Aqui no máximo BOOT_CONNECT_CONCURRENCY conectam juntas, e cada vaga só é liberada quando a instância abre ou
+  // estoura o timeout.
+  private async connectOnBoot(items: { instanceData: BootInstance; instance: any }[]) {
+    if (items.length === 0) {
+      return;
+    }
+
+    const parsed = Number.parseInt(process.env.BOOT_CONNECT_CONCURRENCY ?? '', 10);
+    const concurrency = Number.isFinite(parsed) && parsed > 0 ? parsed : WAMonitoringService.BOOT_CONNECT_CONCURRENCY;
+    const startedAt = Date.now();
+    this.logger.info(`Boot: conectando ${items.length} instâncias, ${concurrency} por vez`);
+
+    let next = 0;
+    const worker = async () => {
+      while (next < items.length) {
+        const { instanceData, instance } = items[next++];
+        try {
+          this.logger.info(
+            `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
+          );
+          await instance.connectToWhatsapp();
+          if (instanceData.integration === Integration.WHATSAPP_BAILEYS) {
+            await this.waitForOpen(instance, WAMonitoringService.BOOT_CONNECT_TIMEOUT_MS);
+          }
+        } catch (error) {
+          this.logger.error(`Instance "${instanceData.instanceName}" - falha ao conectar no boot: ${error?.message}`);
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+
+    this.logger.info(`Boot: ${items.length} instâncias processadas em ${Math.round((Date.now() - startedAt) / 1000)}s`);
+  }
+
+  private async waitForOpen(instance: any, timeoutMs: number) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (instance.connectionStatus?.state === 'open') {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
   }
 
   private async loadInstancesFromRedis() {
     const keys = await this.cache.keys();
 
-    if (keys?.length > 0) {
-      await Promise.all(
-        keys.map(async (k) => {
-          const instanceData = await this.prismaRepository.instance.findUnique({
-            where: { id: k.split(':')[1] },
-          });
-
-          if (!instanceData) {
-            return;
-          }
-
-          const instance = {
-            instanceId: k.split(':')[1],
-            instanceName: k.split(':')[2],
-            integration: instanceData.integration,
-            token: instanceData.token,
-            number: instanceData.number,
-            businessId: instanceData.businessId,
-            connectionStatus: instanceData.connectionStatus as any, // Pass connection status
-          };
-
-          this.setInstance(instance);
-        }),
-      );
+    if (!keys?.length) {
+      return;
     }
+
+    const instances = await Promise.all(
+      keys.map(async (k): Promise<BootInstance | null> => {
+        const instanceData = await this.prismaRepository.instance.findUnique({
+          where: { id: k.split(':')[1] },
+        });
+
+        if (!instanceData) {
+          return null;
+        }
+
+        return {
+          instanceId: k.split(':')[1],
+          instanceName: k.split(':')[2],
+          integration: instanceData.integration,
+          token: instanceData.token,
+          number: instanceData.number,
+          businessId: instanceData.businessId,
+          connectionStatus: instanceData.connectionStatus as any, // Pass connection status
+          disconnectionReasonCode: instanceData.disconnectionReasonCode,
+        };
+      }),
+    );
+
+    await this.setInstances(instances.filter(Boolean));
   }
 
   private async loadInstancesFromDatabasePostgres() {
@@ -417,19 +500,18 @@ export class WAMonitoringService {
       return;
     }
 
-    await Promise.all(
-      instances.map(async (instance) => {
-        this.setInstance({
-          instanceId: instance.id,
-          instanceName: instance.name,
-          integration: instance.integration,
-          token: instance.token,
-          number: instance.number,
-          businessId: instance.businessId,
-          ownerJid: instance.ownerJid,
-          connectionStatus: instance.connectionStatus as any, // Pass connection status
-        });
-      }),
+    await this.setInstances(
+      instances.map((instance) => ({
+        instanceId: instance.id,
+        instanceName: instance.name,
+        integration: instance.integration,
+        token: instance.token,
+        number: instance.number,
+        businessId: instance.businessId,
+        ownerJid: instance.ownerJid,
+        connectionStatus: instance.connectionStatus as any, // Pass connection status
+        disconnectionReasonCode: instance.disconnectionReasonCode,
+      })),
     );
   }
 
@@ -440,21 +522,22 @@ export class WAMonitoringService {
       return;
     }
 
-    await Promise.all(
-      instances?.data?.map(async (instanceId: string) => {
-        const instance = await this.prismaRepository.instance.findUnique({
-          where: { id: instanceId },
-        });
+    const rows = await Promise.all(
+      instances.data.map((instanceId: string) =>
+        this.prismaRepository.instance.findUnique({ where: { id: instanceId } }),
+      ),
+    );
 
-        this.setInstance({
-          instanceId: instance.id,
-          instanceName: instance.name,
-          integration: instance.integration,
-          token: instance.token,
-          businessId: instance.businessId,
-          connectionStatus: instance.connectionStatus as any, // Pass connection status
-        });
-      }),
+    await this.setInstances(
+      rows.filter(Boolean).map((instance) => ({
+        instanceId: instance.id,
+        instanceName: instance.name,
+        integration: instance.integration,
+        token: instance.token,
+        businessId: instance.businessId,
+        connectionStatus: instance.connectionStatus as any, // Pass connection status
+        disconnectionReasonCode: instance.disconnectionReasonCode,
+      })),
     );
   }
 

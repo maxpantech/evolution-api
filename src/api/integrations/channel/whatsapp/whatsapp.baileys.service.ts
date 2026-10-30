@@ -465,6 +465,8 @@ export class BaileysStartupService extends ChannelStartupService {
         this.clearStableConnectionTimer();
         // O banco passa a refletir a queda antes de reconectar. Sem isso, uma reconexão que falhava ou demorava
         // deixava a instância 'close' em memória e 'open' no banco: o painel mostrava conectado e os envios falhavam.
+        // Grava 'connecting' (e não 'close'): o boot só reconecta instâncias open/connecting, e em 30/10/2026 uma
+        // task morta no meio das reconexões deixou 394 instâncias 'close' que nenhum boot seguinte reconectou.
         await this.persistConnectionDrop(statusCode, lastDisconnect);
 
         if (statusCode === DisconnectReason.connectionReplaced) {
@@ -782,7 +784,7 @@ export class BaileysStartupService extends ChannelStartupService {
       await this.prismaRepository.instance.update({
         where: { id: this.instanceId },
         data: {
-          connectionStatus: 'close',
+          connectionStatus: 'connecting',
           disconnectionAt: new Date(),
           disconnectionReasonCode: statusCode,
           disconnectionObject: JSON.stringify(lastDisconnect),
